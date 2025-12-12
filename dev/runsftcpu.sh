@@ -23,42 +23,42 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 
-# wipe the report
-python -m nanochat.report reset
+# wipe the report (跳过，保留之前的训练记录)
+# python -m nanochat.report reset
 
-# train tokenizer on ~1B characters
-python -m nanochat.dataset -n 4
-python -m scripts.tok_train --max_chars=1000000000
-python -m scripts.tok_eval
+# train tokenizer on ~1B characters (跳过，tokenizer 已经训练好了)
+# python -m nanochat.dataset -n 4
+# python -m scripts.tok_train --max_chars=1000000000
+# python -m scripts.tok_eval
 
 # train a very small 4 layer model on the CPU
 # each optimization step processes a single sequence of 1024 tokens
 # we only run 50 steps of optimization (bump this to get better results)
-python -m scripts.base_train \
-    --depth=4 \
-    --max_seq_len=1024 \
-    --device_batch_size=1 \
-    --total_batch_size=1024 \
-    --eval_every=50 \
-    --eval_tokens=4096 \
-    --core_metric_every=-1 \
-    --core_metric_max_per_task=12 \
-    --sample_every=50 \
-    --num_iterations=50
-python -m scripts.base_loss --device_batch_size=1 --split_tokens=4096
-# python -m scripts.base_eval --max-per-task=16
+# python -m scripts.base_train \
+#     --depth=4 \
+#     --max_seq_len=1024 \
+#     --device_batch_size=1 \
+#     --total_batch_size=1024 \
+#     --eval_every=50 \
+#     --eval_tokens=4096 \
+#     --core_metric_every=-1 \
+#     --core_metric_max_per_task=12 \
+#     --sample_every=50 \
+#     --num_iterations=50
+# python -m scripts.base_loss --device_batch_size=1 --split_tokens=4096
+# # python -m scripts.base_eval --max-per-task=16
 
-# midtraining
-python -m scripts.mid_train \
-    --max_seq_len=1024 \
-    --device_batch_size=1 \
-    --eval_every=50 \
-    --eval_tokens=4096 \
-    --total_batch_size=1024 \
-    --num_iterations=100
-# eval results will be terrible, this is just to execute the code paths.
-# note that we lower the execution memory limit to 1MB to avoid warnings on smaller systems
-python -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
+# # midtraining
+# python -m scripts.mid_train \
+#     --max_seq_len=1024 \
+#     --device_batch_size=1 \
+#     --eval_every=50 \
+#     --eval_tokens=4096 \
+#     --total_batch_size=1024 \
+#     --num_iterations=100
+# # eval results will be terrible, this is just to execute the code paths.
+# # note that we lower the execution memory limit to 1MB to avoid warnings on smaller systems
+# python -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
 
 # SFT
 # 允许 MPS 使用更多内存（可能会导致系统变慢）
