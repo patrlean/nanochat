@@ -29,6 +29,7 @@ from tasks.gsm8k import GSM8K
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.sftdata import SFTData
 
 # -----------------------------------------------------------------------------
 # SFT Hyperparameters
@@ -46,10 +47,11 @@ num_epochs = 1
 num_iterations = -1 # override number of iterations (-1 = disable, use num_epochs to derive it)
 target_examples_per_step = 32
 unembedding_lr = 0.004
-embedding_lr = 0.2
+embedding_lr = 0.02
 matrix_lr = 0.02
 weight_decay = 0.0
 init_lr_frac = 0.02
+warmup_ratio = 0.2
 # evaluation and logging there of
 eval_every = 100
 eval_steps = 100
@@ -82,14 +84,15 @@ engine = Engine(model, tokenizer) # will be used for inline model evaluation onl
 # Task data mixture we'll train on
 identity_conversations_filepath = os.path.join(get_base_dir(), "identity_conversations.jsonl")
 train_ds = TaskMixture([
-    ARC(subset="ARC-Easy", split="train"), # 2.3K rows
-    ARC(subset="ARC-Challenge", split="train"), # 1.1K rows
-    GSM8K(subset="main", split="train"), # 8K rows
-    SmolTalk(split="train", stop=10_000), # 10K rows of smoltalk
-    CustomJSON(filepath=identity_conversations_filepath), # 1K rows of synthetic identity conversations
-    SimpleSpelling(size=300, split="train"), # 300 rows of Simple Spelling (e.g. spell the word 'apple')
-    SpellingBee(size=300, split="train"), # 300 rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
-]) # 2.3K + 1.1K + 8K + 10K + 1K + 0.3K + 0.3K = 23K rows
+    # ARC(subset="ARC-Easy", split="train"), # 2.3K rows
+    # ARC(subset="ARC-Challenge", split="train"), # 1.1K rows
+    # GSM8K(subset="main", split="train"), # 8K rows
+    # SmolTalk(split="train", stop=10_000), # 10K rows of smoltalk
+    # CustomJSON(filepath=identity_conversations_filepath), # 1K rows of synthetic identity conversations
+    # SimpleSpelling(size=300, split="train"), # 300 rows of Simple Spelling (e.g. spell the word 'apple')
+    # SpellingBee(size=300, split="train"), # 300 rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    SFTData(), # Custom SFT data from sftdata.jsonl (safety conversations)
+]) # 2.3K + 1.1K + 8K + 10K + 1K + 0.3K + 0.3K + 34 = ~23K rows
 val_ds = SmolTalk(split="test") # general conversations, 24K rows (though we don't actually use all of it)
 
 # -----------------------------------------------------------------------------
@@ -162,10 +165,42 @@ for opt in optimizers:
 
 # Learning rate scheduler
 def get_lr_multiplier(it):
-    lrm = 1.0 - it / num_iterations
-    return lrm
+    # use warmup
+    warmup_iters = round(warmup_ratio * num_iterations)
+    if it < warmup_iters:
+        return (it + 1) / warmup_iters
+    else:
+        # linear decay to 0
+        return 1.0 - (it - warmup_iters) / (num_iterations - warmup_iters)
+
+# -----------------------------------------------------------------------------
+# Checkpoint helper
+
+def save_sft_checkpoint(model, step, val_loss, metrics):
+    """Save SFT checkpoint (rank 0 only)."""
+    base_dir = get_base_dir()
+    depth = model.config.n_layer
+    model_tag = f"d{depth}" # base the model tag on the depth of the base model
+    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
+    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+    save_checkpoint(
+        checkpoint_dir,
+        step,
+        model.state_dict(),
+        None, # note: we don't bother to save the optimizer state
+        {
+            "step": step,
+            "val_loss": val_loss,
+            **(metrics or {}),
+            "model_config": model_config_kwargs,
+        }
+    )
+    print(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
 # Go!
+metrics = {}  # keep last computed metrics (may stay empty if eval is disabled)
+val_loss = float("nan")
+saved_checkpoint = False
 step = 0
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
@@ -191,8 +226,16 @@ for step in range(num_iterations):
         })
         model.train()
 
+    # IMPORTANT: if this is the last step, save checkpoint *before* running metrics eval.
+    # Metrics eval can be expensive on MPS/CPU and may get the process killed, which would
+    # otherwise prevent saving any checkpoint.
+    if last_step and master_process and not saved_checkpoint:
+        save_sft_checkpoint(model, step, val_loss, metrics)
+        saved_checkpoint = True
+
     # evaluate accuracy of the multiple choice tasks (which are quick to run)
-    if last_step or (step > 0 and step % eval_metrics_every == 0):
+    # Allow disabling metrics eval by setting eval_metrics_every <= 0.
+    if eval_metrics_every > 0 and (last_step or (step > 0 and step % eval_metrics_every == 0)):
         model.eval()
         metrics = {}
         with torch.no_grad(), autocast_ctx:
@@ -247,25 +290,8 @@ for step in range(num_iterations):
     step += 1
 
 # Save the model at the end of the run
-if master_process:
-    base_dir = get_base_dir()
-    depth = model.config.n_layer
-    model_tag = f"d{depth}" # base the model tag on the depth of the base model
-    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
-    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
-    save_checkpoint(
-        checkpoint_dir,
-        step,
-        model.state_dict(),
-        None, # note: we don't bother to save the optimizer state
-        {
-            "step": step,
-            "val_loss": val_loss,
-            **metrics,
-            "model_config": model_config_kwargs,
-        }
-    )
-    print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+if master_process and not saved_checkpoint:
+    save_sft_checkpoint(model, step, val_loss, metrics)
 
 # Log to report
 from nanochat.report import get_report

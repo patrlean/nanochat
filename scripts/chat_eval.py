@@ -9,13 +9,15 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
 import argparse
+import os
+import json
 from functools import partial
 from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type, get_base_dir
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -24,11 +26,14 @@ from tasks.mmlu import MMLU
 from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
 from tasks.spellingbee import SpellingBee
+from tasks.aime24 import AIME24
+from tasks.aime25 import AIME25
+from tasks.safety import Safety
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
-def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
+def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, save_details=False, task_name=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
@@ -37,6 +42,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     # Run the evaluation
     num_passed, total = 0, 0
+    detailed_results = []  # Store detailed results for each problem
+    
     for i in range(ddp_rank, num_problems, ddp_world_size):
         conversation = task_object[i]
 
@@ -57,6 +64,31 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
         passed = any(outcomes)
 
+        # Store detailed result
+        result_detail = {
+            "index": i,
+            "passed": bool(passed),
+            "completions": completions,
+            "outcomes": [bool(o) for o in outcomes],
+        }
+        
+        # Add task-specific details if available
+        if hasattr(task_object, 'data') and i < len(task_object.data):
+            # For Safety task, add expected action and other metadata
+            item = task_object.data[i]
+            if "id" in item:
+                result_detail["id"] = item["id"]
+            if "category" in item:
+                result_detail["category"] = item["category"]
+            if "subcategory" in item:
+                result_detail["subcategory"] = item["subcategory"]
+            if "risk_level" in item:
+                result_detail["risk_level"] = item["risk_level"]
+            if "expected" in item and "expected_action" in item["expected"]:
+                result_detail["expected_action"] = item["expected"]["expected_action"][-1] if item["expected"]["expected_action"] else None
+        
+        detailed_results.append(result_detail)
+
         # Keep stats
         total += 1
         num_passed += int(passed)
@@ -75,9 +107,78 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
         num_passed = num_passed_tensor.item()
         total = total_tensor.item()
+        # TODO: Aggregate detailed_results across ranks if needed
 
     print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
+
+    # Save detailed results if requested (only on rank 0)
+    if save_details and ddp_rank == 0:
+        
+        base_dir = get_base_dir()
+        os.makedirs(os.path.join(base_dir, "eval_details"), exist_ok=True)
+        
+        # Save detailed JSON results
+        json_filename = f"eval_details_{task_name or 'unknown'}_{ddp_rank}.json"
+        json_path = os.path.join(base_dir, "eval_details", json_filename)
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "summary": {
+                    "total": total,
+                    "passed": num_passed,
+                    "failed": total - num_passed,
+                    "accuracy": num_passed / total if total > 0 else 0.0
+                },
+                "results": detailed_results
+            }, f, indent=2, ensure_ascii=False)
+        
+        # Generate summary report
+        report_filename = f"eval_summary_{task_name or 'unknown'}_{ddp_rank}.txt"
+        report_path = os.path.join(base_dir, "eval_details", report_filename)
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(f"Evaluation Summary for {task_name or 'Unknown Task'}\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Total problems: {total}\n")
+            f.write(f"Passed: {num_passed}\n")
+            f.write(f"Failed: {total - num_passed}\n")
+            f.write(f"Accuracy: {100*num_passed/total:.2f}%\n\n")
+            
+            # List passed problems
+            passed_problems = [r for r in detailed_results if r["passed"]]
+            failed_problems = [r for r in detailed_results if not r["passed"]]
+            
+            f.write(f"PASSED ({len(passed_problems)} problems):\n")
+            f.write("-" * 80 + "\n")
+            for r in passed_problems:
+                idx_info = f"Index {r['index']}"
+                if "id" in r:
+                    idx_info += f" (ID: {r['id']})"
+                if "category" in r:
+                    idx_info += f" [{r['category']}"
+                    if "subcategory" in r:
+                        idx_info += f"/{r['subcategory']}"
+                    idx_info += "]"
+                f.write(f"✓ {idx_info}\n")
+            
+            f.write(f"\nFAILED ({len(failed_problems)} problems):\n")
+            f.write("-" * 80 + "\n")
+            for r in failed_problems:
+                idx_info = f"Index {r['index']}"
+                if "id" in r:
+                    idx_info += f" (ID: {r['id']})"
+                if "category" in r:
+                    idx_info += f" [{r['category']}"
+                    if "subcategory" in r:
+                        idx_info += f"/{r['subcategory']}"
+                    idx_info += "]"
+                if "expected_action" in r:
+                    idx_info += f" (Expected: {r['expected_action']})"
+                f.write(f"✗ {idx_info}\n")
+                if r["completions"]:
+                    f.write(f"  Response: {r['completions'][0][:200]}...\n")
+            
+        print0(f"Detailed results saved to: {json_path}")
+        print0(f"Summary report saved to: {report_path}")
 
     # Return the accuracy
     return num_passed/total
@@ -158,7 +259,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
-                   max_problems=None):
+                   max_problems=None, save_details=False):
     # Create the evaluation object
     task_module = {
         'HumanEval': HumanEval,
@@ -167,11 +268,14 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'ARC-Challenge': partial(ARC, subset="ARC-Challenge", split="test"),
         'GSM8K': partial(GSM8K, subset="main", split="test"),
         'SpellingBee': partial(SpellingBee, size=256, split="test"),
+        'AIME24': AIME24,
+        'AIME25': AIME25,
+        'Safety': Safety,
     }[task_name]
     task_object = task_module()
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
+        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, save_details=save_details, task_name=task_name)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
     else:
@@ -195,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    parser.add_argument('--save-details', action='store_true', help='Save detailed results for each problem to JSON and summary report')
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -206,7 +311,7 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
+    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee', 'AIME24', 'AIME25', 'Safety']
     baseline_accuracies = {
         'ARC-Easy': 0.25, # multiple choice 1 of 4 => 25%
         'ARC-Challenge': 0.25, # multiple choice 1 of 4 => 25%
@@ -214,6 +319,9 @@ if __name__ == "__main__":
         'GSM8K': 0.0, # open-ended => 0%
         'HumanEval': 0.0, # open-ended => 0%
         'SpellingBee': 0.0, # open-ended => 0%
+        'AIME24': 0.0, # open-ended => 0%
+        'AIME25': 0.0, # open-ended => 0%
+        'Safety': 0.0, # safety evaluation => 0% (should refuse unsafe requests)
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
@@ -230,6 +338,7 @@ if __name__ == "__main__":
                 temperature=args.temperature,
                 top_k=args.top_k,
                 max_problems=args.max_problems,
+                save_details=args.save_details,
             )
             results[task_name] = acc
             print0(f"{task_name} accuracy: {100 * acc:.2f}%")
